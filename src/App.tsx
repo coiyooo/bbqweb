@@ -351,8 +351,8 @@ export default function App() {
 
       if (data.assistant_message) {
         appendMessage('assistant', data.assistant_message);
-        playTTS(data.assistant_message);
       }
+      
 
       await syncStatus();
     } catch (err) {
