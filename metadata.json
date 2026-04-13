@@ -1,0 +1,5 @@
+{
+  "name": "OpenClaw BBQ Master",
+  "description": "Intelligent BBQ robotic arm interaction system powered by OpenClaw agent.",
+  "requestFramePermissions": ["microphone"]
+}
