@@ -21,9 +21,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-const SpeechRecognition =
-  (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
+  
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8788';
 
 type Status = 'idle' | 'running' | 'paused' | 'error' | 'success' | 'offline';
@@ -167,6 +165,8 @@ async function apiGet<T>(path: string): Promise<T> {
   return res.json();
 }
 
+
+
 async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
@@ -210,7 +210,12 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
 
-  const recognitionRef = useRef<any>(null);
+const asrWsRef = useRef<WebSocket | null>(null);
+const audioContextRef = useRef<AudioContext | null>(null);
+const processorRef = useRef<ScriptProcessorNode | null>(null);
+const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+const mediaStreamRef = useRef<MediaStream | null>(null);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const flatKitchenState = useMemo(() => flattenKitchenState(kitchenState), [kitchenState]);
@@ -226,7 +231,171 @@ export default function App() {
       },
     ]);
   };
+  const downsampleBuffer = (
+  buffer: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number
+) => {
+  if (outputSampleRate === inputSampleRate) return buffer;
 
+  const ratio = inputSampleRate / outputSampleRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+};
+
+const floatTo16BitPCM = (float32Array: Float32Array) => {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+
+  let offset = 0;
+  for (let i = 0; i < float32Array.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return buffer;
+};
+
+const stopFunASR = () => {
+  try {
+    asrWsRef.current?.send(JSON.stringify({ type: 'finish' }));
+  } catch {}
+
+  try {
+    processorRef.current?.disconnect();
+  } catch {}
+
+  try {
+    sourceRef.current?.disconnect();
+  } catch {}
+
+  mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+
+  if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+    audioContextRef.current.close().catch(() => {});
+  }
+
+  asrWsRef.current = null;
+  audioContextRef.current = null;
+  processorRef.current = null;
+  sourceRef.current = null;
+  mediaStreamRef.current = null;
+
+  setIsListening(false);
+  setVoiceStatus('idle');
+};
+
+const startFunASR = async () => {
+  try {
+    const ws = new WebSocket('ws://127.0.0.1:8790/asr');
+    ws.binaryType = 'arraybuffer';
+    asrWsRef.current = ws;
+
+    ws.onopen = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStreamRef.current = stream;
+
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+
+        const source = audioContext.createMediaStreamSource(stream);
+        sourceRef.current = source;
+
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = (event) => {
+          if (!asrWsRef.current || asrWsRef.current.readyState !== WebSocket.OPEN) return;
+
+          const inputData = event.inputBuffer.getChannelData(0);
+          const downsampled = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
+          const pcmBuffer = floatTo16BitPCM(downsampled);
+
+          asrWsRef.current.send(pcmBuffer);
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        setIsListening(true);
+        setVoiceStatus('running');
+      } catch (err) {
+        console.error(err);
+        setVoiceStatus('error');
+        stopFunASR();
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'result') {
+          if (typeof data.text === 'string') {
+            setUserInput(data.text);
+          }
+        }
+
+        if (data.type === 'error') {
+          console.error('FunASR error:', data.message);
+          setVoiceStatus('error');
+          stopFunASR();
+        }
+
+        if (data.type === 'task-finished') {
+          stopFunASR();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    ws.onerror = (err) => {
+      console.error(err);
+      setVoiceStatus('error');
+      stopFunASR();
+    };
+
+    ws.onclose = () => {
+      setIsListening(false);
+      setVoiceStatus('idle');
+    };
+  } catch (err) {
+    console.error(err);
+    setVoiceStatus('error');
+    stopFunASR();
+  }
+};
+
+const toggleVoiceInput = async () => {
+  if (isListening) {
+    stopFunASR();
+    return;
+  }
+
+  await startFunASR();
+};
   const playTTS = (content: string) => {
     if (!content || !('speechSynthesis' in window)) return;
 
@@ -274,62 +443,6 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    syncStatus();
-    const timer = setInterval(syncStatus, 1000);
-    return () => clearInterval(timer);
-  }, [isListening]);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  useEffect(() => {
-    if (SpeechRecognition) {
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
-      recognitionRef.current.lang = 'zh-CN';
-
-      recognitionRef.current.onstart = () => {
-        setIsListening(true);
-        setVoiceStatus('running');
-      };
-
-      recognitionRef.current.onresult = (event: any) => {
-        const transcript = event.results?.[0]?.[0]?.transcript || '';
-        setUserInput(transcript);
-      };
-
-      recognitionRef.current.onerror = () => {
-        setIsListening(false);
-        setVoiceStatus('error');
-      };
-
-      recognitionRef.current.onend = () => {
-        setIsListening(false);
-        setVoiceStatus('idle');
-      };
-    }
-  }, []);
-
-  const toggleVoiceInput = () => {
-    if (!SpeechRecognition) {
-      alert('当前浏览器不支持语音识别，请优先使用 Chrome。');
-      return;
-    }
-
-    if (isListening) {
-      recognitionRef.current?.stop();
-      return;
-    }
-
-    try {
-      recognitionRef.current?.start();
-    } catch (err) {
-      console.error(err);
-    }
-  };
 
   const handleSend = async (forcedText?: string) => {
     const text = (forcedText ?? userInput).trim();
